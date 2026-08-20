@@ -22,6 +22,7 @@ WiFi DensePose turns commodity WiFi signals into real-time human pose estimation
    - [ESP32-S3 (Full CSI)](#esp32-s3-full-csi)
    - [ESP32 Multistatic Mesh (Advanced)](#esp32-multistatic-mesh-advanced)
    - [Connect Mesh Data to the Dashboard and Observatory](#connect-mesh-data-to-the-dashboard-and-observatory)
+   - [Cognitum Spaces activation](#cognitum-spaces-activation)
    - [Cognitum Seed Integration (ADR-069)](#cognitum-seed-integration-adr-069)
 5. [REST API Reference](#rest-api-reference)
 6. [WebSocket Streaming](#websocket-streaming)
@@ -38,6 +39,7 @@ WiFi DensePose turns commodity WiFi signals into real-time human pose estimation
 14. [Training a Model](#training-a-model)
     - [CRV Signal-Line Protocol](#crv-signal-line-protocol)
 14. [RVF Model Containers](#rvf-model-containers)
+14. [Perception Certificate Spine (Developer Preview, ADR-300)](#perception-certificate-spine-developer-preview-adr-297)
 14. [Hardware Setup](#hardware-setup)
     - [ESP32-S3 Mesh](#esp32-s3-mesh)
     - [Intel 5300 / Atheros NIC](#intel-5300--atheros-nic)
@@ -423,6 +425,57 @@ curl http://localhost:3000/api/v1/sensing/latest
 ```
 
 If the ESP32 nodes are provisioned with `--target-ip <AGGREGATOR_HOST>`, that IP must be the machine running `sensing-server`. Only one process can receive UDP `:5005` at a time, so leave the standalone hardware `aggregator` off while the dashboard or Observatory is live.
+
+### Cognitum Spaces activation
+
+Cognitum Spaces gives RuView a tenant/workspace-scoped semantic world model
+without uploading raw RF/CSI, recordings, pose frames, vital waveforms, or
+identity observations. It represents sites, buildings, floors, bounded
+rooms/spaces, zones, anonymous entities, semantic events, and alerts.
+
+Activate the public RuView OAuth client with Authorization Code + PKCE:
+
+```bash
+wifi-densepose login --spaces
+wifi-densepose whoami
+wifi-densepose spaces --resource sites --limit 50
+wifi-densepose spaces --resource events --limit 25
+```
+
+The login requests `sensing:read spaces:read`. That consent is read-only: it
+does not grant publication, pairing, policy approval, command, or actuator
+authority. Versioned collections are `sites`, `buildings`, `floors`,
+`spaces`, `zones`, `entities`, `events`, and `alerts`. A returned
+`nextCursor` is opaque and valid only for the same collection.
+
+The dependency-free contributor harness exposes the same read path:
+
+```bash
+npx @ruvnet/ruview@0.5.0 spaces --resource alerts --limit 25
+npx @ruvnet/ruview@0.5.0 mcp start
+```
+
+Its MCP tool is `ruview_spaces_list`. MCP reads are OAuth-only, use the fixed
+Cognitum API origin, and require the explicit guarded-tool opt-in. The harness
+does not accept an arbitrary credential path or API origin.
+
+For service compatibility, `wifi-densepose spaces` can read
+`COGNITUM_SPACES_API` at request time. API-key access to a versioned collection
+also requires `--workspace <uuid>`; OAuth derives the workspace from the
+signed token. Never print or commit either credential.
+
+Every response is bounded and revalidated. Raw-sensing aliases, malformed
+hierarchy, non-anonymous person/track entities, invalid timestamps, stale
+confidence, and oversized structures fail closed. Empty data means no
+authorized state is present; it does not prove that a physical site is empty.
+
+RuVector spatial memory remains physically separated by tenant and workspace.
+Agents observe or recommend by default. Any consequential execution requires a
+separate policy/grant/approval decision and produces a signed, hash-chained
+receipt; the Spaces read token can never satisfy that gate.
+
+See ADR-325, ADR-326, and ADR-327 for the activation, memory, and governed-action
+decisions.
 
 ### Cognitum Seed Integration (ADR-069)
 
@@ -1490,6 +1543,101 @@ An RVF file contains: model weights, HNSW vector index, quantization codebooks, 
 | Mobile / WASM | int8 | ~6-10 MB | ~200-500ms |
 | Field (WiFi-Mat) | fp16 | ~62 MB | ~2s |
 | Server / Cloud | f32 | ~50+ MB | ~3s |
+
+---
+
+## Perception Certificate Spine (Developer Preview, ADR-300)
+
+RuView's perception substrate program (ADR-300) is building a `signal → observation →
+calibration → inference → uncertainty → evidence → certificate → policy → governed
+action` pipeline, where a downstream consumer either gets a calibrated, provenance-backed
+answer or an explicit `UNKNOWN` — never a confident-looking guess outside the sensor's
+proven operating envelope.
+
+**Status: developer preview, now wired at the crate level.** Phase 1 shipped nine new
+crates. `ruview-certify` and `ruview-policy` now depend on `ruview-ood` and provide a
+real adapter (`impl From<ruview_ood::DomainState> for _`) plus a composed entry point,
+`ruview_policy::authorize_from_certificate`, that takes a real signed
+`CapabilityCertificate` and a real `ruview_ood::DomainState` and drives them through
+`authorize()` — not a hand-built `AssuranceInputs`. A cross-crate integration test
+(`ruview-policy`'s `acceptance_test_b_real_integration` module) mints an actual signed
+certificate and proves a real post-drift `Unknown` denies a `SafetyCritical` action
+through that one composed pipeline.
+
+**What's still not done:** none of this runs automatically inside the live
+`sensing-server` request path yet — there is no continuous calibration/OOD-monitoring
+loop wired into the running server that calls this pipeline on live sensor data. Treat
+`authorize_from_certificate` as a real, tested library entry point you can call from your
+own integration today, not something the server invokes for you on every request yet.
+That remaining step is a genuinely separate, larger effort (deciding polling cadence,
+where calibration state lives, what triggers re-certification) — see ADR-300 for the
+phased plan.
+
+### The crates
+
+| Crate | Role |
+|---|---|
+| `ruview-ontology` | Canonical `Site → … → Event` types |
+| `ruview-attest` | Signed measurement / RF chain-of-custody |
+| `ruview-evidence` | Append-only per-context ledger (no pooling, no evidence upgrade) |
+| `wifi-densepose-calibration` | Signed, drift-invalidatable calibration certificate |
+| `ruview-ood` | `Known` / `Degraded` / `Unknown` staleness-guard domain gating |
+| `ruview-witness` | Hash-linked staged provenance chain |
+| `ruview-certify` | Capability certificate, conditional on a live domain signature |
+| `ruview-scorecard` | Multi-domain scorecard, worst-domain promotion gate |
+| `ruview-policy` | Fail-closed action authorization gate |
+
+### Minting and checking a certificate
+
+```rust
+use ruview_certify::{mint, CapabilityCertificate, DomainState};
+
+// `signer`, `request`, and `evidence_slice` come from your own calibration run —
+// see each crate's README for how to build them.
+let cert = mint(&signer, request, &evidence_slice)?;
+
+// A certificate is only valid at a given instant AND domain state — the same
+// signed certificate is rejected the moment the live domain degrades:
+assert!(cert.is_valid(now_ms, DomainState::Known));
+assert!(!cert.is_valid(now_ms, DomainState::Degraded));
+assert!(!cert.is_valid(now_ms, DomainState::Unknown));
+```
+
+### Gating an action from a real certificate + a real OOD reading
+
+```rust
+use ruview_policy::authorize_from_certificate;
+
+// `cert` (ruview_certify::CapabilityCertificate) and `domain`
+// (ruview_ood::DomainState) come from your own certify/OOD calls.
+let decision = authorize_from_certificate(
+    ActionClass::SafetyCritical,
+    &cert, &verifier, now_unix_s, domain,
+    certificate_class, uncertainty, evidence_level,
+);
+// Deny with a named FailedCondition (e.g. DomainNotKnown) — not a silent
+// false-positive — the moment `domain` degrades, even though `cert` itself
+// is still validly signed and unexpired.
+```
+
+`ruview_certify::DomainState` and `ruview_policy::DomainState` are still each their own
+type (`ruview-ood`'s `Degraded`/`Unknown` additionally carry a `DomainCause`), but the
+conversion between them is no longer something you have to write yourself —
+`authorize_from_certificate` does it via the crates' own `From<ruview_ood::DomainState>`
+impls.
+
+### What's genuinely enforced today, for comparison
+
+Not every ADR-295–296 remediation item is preview-only. Three are live now:
+
+- **UDP data-plane bind hardening (ADR-296)** — `sensing-server`'s `UdpSourceAllowlist`
+  is checked on every incoming packet (`main.rs`), not just defined.
+- **CSI data-incident repo controls (ADR-299)** — `scripts/csi-data-policy-check.sh`
+  runs in CI on every push/PR and fails the build on a policy violation.
+- **Synthetic-export watermarking (ADR-295)** — `start_recording` stamps a `SYNTHETIC`
+  watermark on a recording's metadata (`GET /api/v1/recordings`, the start-recording
+  response) whenever it captures while the live source is synthetic — an operator
+  browsing or scripting against recordings can't mistake generated data for a capture.
 
 ---
 
